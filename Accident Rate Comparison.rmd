@@ -1,0 +1,125 @@
+---
+title: "Computational Bayesian Coursework: Peak Traffic Accident Rates"
+author: "Muneeb (Student #: 151244472)"    
+output: pdf_document
+---
+
+## 1. Abstract
+|       The goal of this report is to compare the number of accidents in peak commute working hours vs non-peak hours and see if there is a statistically significant difference between the two. This is done by using Bayesian Inference and running a STAN model on two samples with the same conjugate prior. By demonstrating two different parameter values, the method establishes that there was enough proof in the data to skew the posterior in different directions. 
+
+## 2. Data
+
+|       The US Accidents (2016-21) is a traffic dataset available on [Kaggle](https://www.kaggle.com/datasets/sobhanmoosavi/us-accidents?resource=download). First compiled in 2019, it has been updated by Moosavi et al. [1] from Ohio State University since then each year. Data was primarily pulled from MapQuest (~70%) and MS Bing Traffic Collector (~30%) APIs. These APIs broadcast events US state and federal transportation agencies, law-enforcement agencies, traffic cameras, and traffic sensors. Conservative settings described in the paper were used to ensure removal of duplicates across sources.  
+|       Once the accident data was gathered in 2019, it was updated in 2020 and 2021 separately. These updates have made the data quality in recent years better; however it also means previous year trends might not align anymore.  
+|       After integrating the datasets, the new combined dataset is augmented with other potential features ranging from geo-location to weather data. These can be important features when trying to explain what causes accident rates to be so high; however, since we are majorly concerned with if accidents counts are higher during peak commmute hours we can ignore most of the features. Therefore, in this report we use just the timestamp of when the accident happened.  
+
+### 2.1 Loading Data
+
+As this is a large dataset, the data can be efficiently loaded using the fread function in data.table 
+``` {r}
+library(data.table)
+setwd("/mnt/d/Grad/Period 2/Computational Bayesian")
+
+# # You can use this piece of code to load the dataset from the kaggle csv file 
+# # https://www.kaggle.com/datasets/sobhanmoosavi/us-accidents?resource=download
+# acc.data <- fread("US_Accidents_Dec21_updated.csv")
+# colnames(acc.data) <- sapply(colnames(acc.data), tolower)
+# acc.data <- acc.data[,acc_time:=ymd_hms(start_time)
+#          ][,is_weekday:=fcase(wday(acc_time)%%7>1,1,default=0)
+#          ][,hour:=hour(acc_time)
+#          ][,day:=date(acc_time)
+#          ][,year:=year(acc_time)
+#          ][,.(id, severity, acc_time, is_weekday, hour, day, year)]
+
+acc.data <- fread("sample_accidents.csv")[,.(id, acc_time, is_weekday, hour, day, year)]
+acc.data |> head()
+``` 
+
+### 2.2 Exploring Data
+
+``` {r echo=FALSE, warning=FALSE}
+library(ggplot2)
+ggplot(data=acc.data[,.(is_weekday=as.factor(is_weekday), hour=as.integer(hour), year)])+
+  geom_histogram(aes(x=hour, y=after_stat(count), fill=is_weekday), alpha=0.5, bins = 24) +
+  facet_grid(is_weekday~year) +
+  theme(strip.text.x = element_text(margin = margin(0, 0, 0, 0)))
+```
+
+|       Observing the data, there are a few points that immediately pop out. Firstly, data before 2020 seems to be severely under-counted. Natural trends don't indicate any reason that yearly accidents should increase almost four-fold. Therefore, it is reasonable to believe that the underlying data collection was improved in 2020 and once again in 2021. This also alligns with how this data was collected, initially in 2019 up till 2019 and then updated once per year. Therefore, moving on with this data we will only be using data from 2021 (2020 can be ignored due to COVID-19 as well). Secondly, weekday and weekend trends seem to differ. Hence, we'll also only be using weekday data to try and control for outside factors. 
+
+## 3. Statistical Method
+
+|       Looking at the data we can immediately see that the number of accidents in an hour can be modeled as a Poisson distribution with a certain mean, $\lambda$. Expanding on this idea, we can compare two distributions, one for peak commute hours and one for without. The overlap in the posterior distribution of the mean rates would indicate how likely or unlikely it is that there is a difference.  
+|       We define peak commute hours as 8-10 am and 4-6 pm. Non peak hours are between 10 am and 11 pm not included in peak hours. Midnight to 7 am is not included to avoid decreasing the accident counts in the non-peak hour sample due to general inactivity.   
+|       A STAN model will be fit on these two samples with the same prior to investigate if the underlying distribution is the same or not. STAN uses Metropolis-Hastings Algorithm to sample from the posterior distribution. MHC works by drawing samples from a proposed distribution conditional on the previous sample. It accepts these samples as distributions from the target distribution with a ratio of the relative densities of the two distributions. In this case, since the prior was set to be a Gamma distribution, a conjugate of the Poisson distribution, there also exists a closed-form solution of this set up. 
+
+## 3.1 STAN Model
+We sample for two parameters $\lambda_{high}$ and $\lambda_{low}$ of a Poisson distribution, both with the same non-informative Gamma prior. 
+
+``` {stan output.var = 'acc.stan'}
+data {
+  int<lower=1> n[2];
+  int Y_low[n[1]];
+  int Y_high[n[2]];
+}
+parameters {
+  real<lower=0> lambda_high;
+  real<lower=0> lambda_low;
+}
+model {
+    Y_high ~ poisson(lambda_high);
+    Y_low ~ poisson(lambda_low);
+    lambda_high ~ gamma(15,15);
+    lambda_low ~ gamma(15,15);
+}
+```
+
+## 3.2 Model Sampling and Evaluation
+
+``` {r results="hide", warning=FALSE, message=FALSE}
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+acc.data_filterd <- acc.data[year==2021 & is_weekday==1,.(.N),by=.(day, hour)]
+model.data <- list(n=c(acc.data_filterd[hour %in% c(11,12,13,14,15,19,20,21,22),.N], 
+                       acc.data_filterd[hour %in% c(8,9,10,16,17,18),.N]), 
+                   Y_low=acc.data_filterd[hour %in% c(11,12,13,14,15,19,20,21,22),N],
+                   Y_high=acc.data_filterd[hour %in% c(8,9,10,16,17,18),N])
+
+acc.model <- sampling(acc.stan,
+                         data=model.data,
+                         chains = 4,
+                         warmup = 500,
+                         iter = 1000,
+                         cores = 4
+                      )
+```
+
+
+``` {r echo=FALSE}
+summary(acc.model)$summary
+```
+
+``` {r echo=FALSE, warning=FALSE, message=FALSE }
+samps <- extract(acc.model, c("lambda_low", "lambda_high"))
+samps$lambda_prior <- rgamma(2000, 10, 1/15)
+samps <- melt(as.data.table(samps), 
+              measure.vars = c("lambda_low", "lambda_high", "lambda_prior"))
+samps <- rbind(samps, 
+      as.data.table(model.data$Y_high)[,value:=V1][,variable:="lkhd_high"][,.(value, variable)],
+      as.data.table(model.data$Y_low)[,value:=V1][,variable:="lkhd_low"][,.(value, variable)])
+
+ggplot(samps)+
+  geom_histogram(aes(x=value, y=..density.., fill=variable), bins=25, alpha=0.8, show.legend = FALSE)+
+  facet_wrap(~variable, scales="free")
+
+```
+
+|       The model shows a significant difference between $\lambda_{low}$ and $\lambda_{high}$. The 95% credible interval for $\lambda_{low}$ is between 216.04 and 217.13 whereas the 95% CI for $\lambda_{high}$ is 257.82 to 259.39. With such a huge difference w.r.t. the deviations in each parameter, we can confidently say that accidents during peak commute hours happen with a higher mean rate than accidents in non-peak commute hours. In fact if we use the posterior samples that STAN generates and do a Monte Carlo simulation all 100% of $\lambda_{high}$ are greater than $\lambda_{low}$.  
+|       Furthermore, the Rhat value in STAN indicates that each chain converged i.e. for four chains, four random starting points were picked and by the end of the iteration, there was no way to know which value came from which chain. This further increases the confidence in the result presented in this report.  
+
+## References 
+* [1] Moosavi, Sobhan, Mohammad Hossein Samavatian, Srinivasan Parthasarathy, and Rajiv Ramnath. “A Countrywide Traffic Accident Dataset.”, 2019.
+
+
